@@ -39,7 +39,7 @@ class FundusVesselDataset(Dataset):
             
         # Find all image files
         self.img_paths = sorted(glob.glob(os.path.join(base_dir, mode, "images", "*.tif")))
-        self.mask_paths = sorted(glob.glob(os.path.join(base_dir, mode, "masks", "*.tif")))
+        self.mask_paths = sorted(glob.glob(os.path.join(base_dir, mode, "masks", "*.png")))
         
         # Verify matching images and masks
         assert len(self.img_paths) == len(self.mask_paths), "Number of images and masks don't match"
