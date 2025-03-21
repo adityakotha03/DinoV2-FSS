@@ -2,6 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+# import os
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+def safe_norm(x, p=2, dim=1, eps=1e-4):
+        """Normalize features"""
+        x_norm = torch.norm(x, p=p, dim=dim)
+        x_norm = torch.max(x_norm, torch.ones_like(x_norm).cuda() * eps)
+        x = x.div(x_norm.unsqueeze(1).expand_as(x))
+        return x
 
 class ProtoModule(nn.Module):
     """
@@ -16,83 +25,58 @@ class ProtoModule(nn.Module):
         self.kernel_size = [ft_l // proto_grid_size for ft_l in feature_hw]
         self.avg_pool_op = nn.AvgPool2d(self.kernel_size)
         
-    def safe_norm(self, x, p=2, dim=1, eps=1e-4):
-        """Normalize features"""
-        x_norm = torch.norm(x, p=p, dim=dim)
-        x_norm = torch.max(x_norm, torch.ones_like(x_norm).cuda() * eps)
-        x = x.div(x_norm.unsqueeze(1).expand_as(x))
-        return x
     
     def get_prototypes(self, sup_x, sup_y, mode, thresh=0.95):
-        """
-        Extract prototypes from support image features - simplified version
-        """
-        if mode == 'mask':
-            # Global prototype approach - average all features in the foreground mask
-            proto = torch.sum(sup_x * sup_y, dim=(-1, -2)) / (sup_y.sum(dim=(-1, -2)) + 1e-5)
-            prototypes = proto
-            proto_grid = sup_y.clone().detach()
-            non_zero = torch.nonzero(proto_grid)
-            
-        elif mode == 'gridconv':
-            # Simpler grid-based prototype approach
-            
-            # Use masked average pooling instead of complex indexing
-            bs, c, h, w = sup_x.shape
-            
-            # Create empty list to store prototypes
-            protos_list = []
-            
-            # Process each support image separately
-            for i in range(bs):
-                # Get features and mask for this support image
-                feat_i = sup_x[i]  # [C, H, W]
-                mask_i = sup_y[i]  # [1, H, W]
-                
-                # Apply threshold to the mask
-                mask_i_bin = (mask_i > thresh).float()
-                
-                # Skip if no foreground
-                if mask_i_bin.sum() < 1:
-                    continue
-                
-                # Apply average pooling to both features and mask
-                feat_pooled = self.avg_pool_op(feat_i.unsqueeze(0))[0]  # [C, h, w]
-                mask_pooled = self.avg_pool_op(mask_i_bin)[0]  # [1, h, w]
-                
-                # Apply threshold to pooled mask
-                mask_pooled_bin = (mask_pooled > 0.5).float()
-                
-                # Only keep grid cells with sufficient foreground
-                valid_locations = mask_pooled_bin[0] > 0  # [h, w]
-                
-                # If no valid locations, skip this support image
-                if valid_locations.sum() == 0:
-                    continue
-                
-                # Extract features at valid locations
-                for hi in range(valid_locations.shape[0]):
-                    for wi in range(valid_locations.shape[1]):
-                        if valid_locations[hi, wi]:
-                            # Extract feature vector at this location
-                            proto_feat = feat_pooled[:, hi, wi]  # [C]
-                            protos_list.append(proto_feat)
-            
-            # Stack all prototypes
-            if len(protos_list) > 0:
-                protos = torch.stack(protos_list, dim=0)  # [num_protos, C]
-                prototypes = self.safe_norm(protos)
-            else:
-                # Fallback to mask mode if no prototypes found
-                print("Warning: No valid prototypes found in gridconv mode. Falling back to mask mode.")
-                return self.get_prototypes(sup_x, sup_y, mode='mask', thresh=thresh)
-                
-            # Create prototype grid for visualization
-            proto_grid = sup_y.clone().detach()
-            proto_grid = (proto_grid > thresh).float()
-            non_zero = torch.nonzero(proto_grid)
-            
-        return prototypes, proto_grid, non_zero
+         """
+         Extract prototypes from support image features
+         
+         Args:
+             sup_x: Support image features [nshot, C, H, W]
+             sup_y: Support image masks [nshot, 1, H, W]
+             mode: Prototype extraction mode ('mask' or 'gridconv')
+             thresh: Threshold for considering a grid cell as foreground
+             
+         Returns:
+             prototypes: Normalized prototypes
+             proto_grid: Grid showing prototype assignment
+         """
+         if mode == 'mask':
+             # Global prototype (average features in the mask)
+             proto = torch.sum(sup_x * sup_y, dim=(-1, -2)) / (sup_y.sum(dim=(-1, -2)) + 1e-5)
+             prototypes = proto
+             proto_grid = sup_y.clone().detach()
+             non_zero = torch.nonzero(proto_grid)
+             
+         elif mode == 'gridconv':
+             # Local prototypes (grid-based)
+             nch = sup_x.shape[1]
+             sup_nshot = sup_x.shape[0]
+             
+             # Apply average pooling to get grid-level features
+             n_sup_x = self.avg_pool_op(sup_x)
+             n_sup_x = n_sup_x.view(sup_nshot, nch, -1).permute(0, 2, 1).unsqueeze(0)
+             n_sup_x = n_sup_x.reshape(1, -1, nch).unsqueeze(0)
+             
+             # Apply average pooling to masks
+             sup_y_g = self.avg_pool_op(sup_y)
+             
+             # Create prototype grid
+             proto_grid = sup_y_g.clone().detach()
+             proto_grid[proto_grid < thresh] = 0
+             non_zero = torch.nonzero(proto_grid)
+             
+             # Get features for grid cells above threshold
+             sup_y_g = sup_y_g.view(sup_nshot, 1, -1).permute(1, 0, 2).view(1, -1).unsqueeze(0)
+             protos = n_sup_x[sup_y_g > thresh, :]  # npro, nc
+             
+             if protos.shape[0] == 0:
+                 print("Warning: Failed to find prototypes, falling back to mask mode")
+                 return self.get_prototypes(sup_x, sup_y, mode='mask', thresh=thresh)
+                 
+             # Normalize prototypes
+             prototypes = safe_norm(protos)
+         
+         return prototypes, proto_grid, non_zero
     
     def get_prediction(self, prototypes, query, mode):
         """
@@ -110,16 +94,13 @@ class ProtoModule(nn.Module):
             pred_grid = torch.sum(F.softmax(dists, dim=1) * dists, dim=1, keepdim=True)
             debug_assign = dists.argmax(dim=1).float().detach()
             return pred_grid, [debug_assign]
-            
-        else:
-            raise ValueError(f"Invalid mode: {mode}. Expected 'mask' or 'gridconv'")
     
     def forward(self, qry, sup_x, sup_y, mode='gridconv', thresh=0.95):
         """
         Forward pass
         """
         # Normalize query features
-        qry_n = qry if mode == 'mask' else self.safe_norm(qry)
+        qry_n = qry if mode == 'mask' else safe_norm(qry)
         
         # Get prototypes from support images
         prototypes, proto_grid, proto_indices = self.get_prototypes(sup_x, sup_y, mode, thresh)
