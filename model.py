@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-# import os
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
 
 def safe_norm(x, p=2, dim=1, eps=1e-4):
         """Normalize features"""
@@ -15,72 +14,88 @@ def safe_norm(x, p=2, dim=1, eps=1e-4):
 class ProtoModule(nn.Module):
     """
     Prototype Module for the ALPNet model.
+    Computes prototype-based segmentation.
     """
     def __init__(self, proto_grid_size=8, feature_hw=[64, 64], embed_dim=256):
+        """
+        Args:
+            proto_grid_size: Grid size for multi-prototyping
+            feature_hw: Spatial size of input feature maps
+            embed_dim: Embedding dimension
+        """
         super(ProtoModule, self).__init__()
         self.proto_grid_size = proto_grid_size
         self.feature_hw = feature_hw
         
         # Calculate kernel size for average pooling
-        self.kernel_size = [ft_l // proto_grid_size for ft_l in feature_hw]
+        self.kernel_size = [ft_l // grid_l for ft_l, grid_l in zip(feature_hw, [proto_grid_size, proto_grid_size])]
         self.avg_pool_op = nn.AvgPool2d(self.kernel_size)
         
     
     def get_prototypes(self, sup_x, sup_y, mode, thresh=0.95):
-         """
-         Extract prototypes from support image features
-         
-         Args:
-             sup_x: Support image features [nshot, C, H, W]
-             sup_y: Support image masks [nshot, 1, H, W]
-             mode: Prototype extraction mode ('mask' or 'gridconv')
-             thresh: Threshold for considering a grid cell as foreground
-             
-         Returns:
-             prototypes: Normalized prototypes
-             proto_grid: Grid showing prototype assignment
-         """
-         if mode == 'mask':
-             # Global prototype (average features in the mask)
-             proto = torch.sum(sup_x * sup_y, dim=(-1, -2)) / (sup_y.sum(dim=(-1, -2)) + 1e-5)
-             prototypes = proto
-             proto_grid = sup_y.clone().detach()
-             non_zero = torch.nonzero(proto_grid)
-             
-         elif mode == 'gridconv':
-             # Local prototypes (grid-based)
-             nch = sup_x.shape[1]
-             sup_nshot = sup_x.shape[0]
-             
-             # Apply average pooling to get grid-level features
-             n_sup_x = self.avg_pool_op(sup_x)
-             n_sup_x = n_sup_x.view(sup_nshot, nch, -1).permute(0, 2, 1).unsqueeze(0)
-             n_sup_x = n_sup_x.reshape(1, -1, nch).unsqueeze(0)
-             
-             # Apply average pooling to masks
-             sup_y_g = self.avg_pool_op(sup_y)
-             
-             # Create prototype grid
-             proto_grid = sup_y_g.clone().detach()
-             proto_grid[proto_grid < thresh] = 0
-             non_zero = torch.nonzero(proto_grid)
-             
-             # Get features for grid cells above threshold
-             sup_y_g = sup_y_g.view(sup_nshot, 1, -1).permute(1, 0, 2).view(1, -1).unsqueeze(0)
-             protos = n_sup_x[sup_y_g > thresh, :]  # npro, nc
-             
-             if protos.shape[0] == 0:
-                 print("Warning: Failed to find prototypes, falling back to mask mode")
-                 return self.get_prototypes(sup_x, sup_y, mode='mask', thresh=thresh)
-                 
-             # Normalize prototypes
-             prototypes = safe_norm(protos)
-         
-         return prototypes, proto_grid, non_zero
+        """
+        Extract prototypes from support image features
+        
+        Args:
+            sup_x: Support image features [nshot, C, H, W]
+            sup_y: Support image masks [nshot, 1, H, W]
+            mode: Prototype extraction mode ('mask' or 'gridconv')
+            thresh: Threshold for considering a grid cell as foreground
+            
+        Returns:
+            prototypes: Normalized prototypes
+            proto_grid: Grid showing prototype assignment
+        """
+        if mode == 'mask':
+            # Global prototype (average features in the mask)
+            proto = torch.sum(sup_x * sup_y, dim=(-1, -2)) / (sup_y.sum(dim=(-1, -2)) + 1e-5)
+            prototypes = proto
+            proto_grid = sup_y.clone().detach()
+            non_zero = torch.nonzero(proto_grid)
+            
+        elif mode == 'gridconv':
+            # Local prototypes (grid-based)
+            nch = sup_x.shape[1]
+            sup_nshot = sup_x.shape[0]
+            
+            # Apply average pooling to get grid-level features
+            n_sup_x = self.avg_pool_op(sup_x)
+            n_sup_x = n_sup_x.view(sup_nshot, nch, -1).permute(0, 2, 1).unsqueeze(0)
+            n_sup_x = n_sup_x.reshape(1, -1, nch).unsqueeze(0)
+            
+            # Apply average pooling to masks
+            sup_y_g = self.avg_pool_op(sup_y)
+            
+            # Create prototype grid
+            proto_grid = sup_y_g.clone().detach()
+            proto_grid[proto_grid < thresh] = 0
+            non_zero = torch.nonzero(proto_grid)
+            
+            # Get features for grid cells above threshold
+            sup_y_g = sup_y_g.view(sup_nshot, 1, -1).permute(1, 0, 2).view(1, -1).unsqueeze(0)
+            protos = n_sup_x[sup_y_g > thresh, :]  # npro, nc
+            
+            if protos.shape[0] == 0:
+                print("Warning: Failed to find prototypes, falling back to mask mode")
+                return self.get_prototypes(sup_x, sup_y, mode='mask', thresh=thresh)
+                
+            # Normalize prototypes
+            prototypes = safe_norm(protos)
+        
+        return prototypes, proto_grid, non_zero
     
     def get_prediction(self, prototypes, query, mode):
         """
         Generate predictions using prototypes
+        
+        Args:
+            prototypes: Extracted prototypes
+            query: Query image features
+            mode: Prediction mode
+            
+        Returns:
+            pred: Prediction map
+            debug_assign: Debug information for visualization
         """
         if mode == 'mask':
             # Global prototype matching
@@ -94,10 +109,25 @@ class ProtoModule(nn.Module):
             pred_grid = torch.sum(F.softmax(dists, dim=1) * dists, dim=1, keepdim=True)
             debug_assign = dists.argmax(dim=1).float().detach()
             return pred_grid, [debug_assign]
+            
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Expected 'mask' or 'gridconv'")
     
     def forward(self, qry, sup_x, sup_y, mode='gridconv', thresh=0.95):
         """
         Forward pass
+        
+        Args:
+            qry: Query image features [1, C, H, W]
+            sup_x: Support image features [nshot, C, H, W]
+            sup_y: Support image masks [nshot, 1, H, W]
+            mode: Operation mode
+            thresh: Threshold for prototype extraction
+            
+        Returns:
+            pred: Prediction map
+            debug_assign: Debug information
+            proto_grid: Grid showing prototype locations
         """
         # Normalize query features
         qry_n = qry if mode == 'mask' else safe_norm(qry)
@@ -115,6 +145,12 @@ class FewShotSeg(nn.Module):
     Few-shot segmentation model for eye fundus vessel segmentation
     """
     def __init__(self, image_size=512, pretrained_path=None, cfg=None):
+        """
+        Args:
+            image_size: Input image size
+            pretrained_path: Path to pretrained weights
+            cfg: Model configuration
+        """
         super(FewShotSeg, self).__init__()
         self.image_size = image_size
         self.pretrained_path = pretrained_path
@@ -202,6 +238,18 @@ class FewShotSeg(nn.Module):
     def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval=False, val_wsize=None):
         """
         Forward pass for few-shot segmentation
+        
+        Args:
+            supp_imgs: Support images [way, [shot]]
+            fore_mask: Foreground masks for support images [way, [shot]]
+            back_mask: Background masks for support images [way, [shot]]
+            qry_imgs: Query images [n_queries]
+            isval: Whether in validation mode
+            val_wsize: Window size for validation
+            
+        Returns:
+            output: Segmentation output
+            align_loss: Alignment loss value (for training)
         """
         n_ways = len(supp_imgs)
         n_shots = len(supp_imgs[0])
@@ -216,9 +264,9 @@ class FewShotSeg(nn.Module):
         # Extract features
         features = self.get_features(imgs_concat)
         
-        # Split features into support and query (using contiguous for reshaping)
-        supp_fts = features[:n_ways * n_shots].contiguous().view(n_ways, n_shots, -1, *features.shape[-2:])
-        qry_fts = features[n_ways * n_shots:].contiguous().view(n_queries, -1, *features.shape[-2:])
+        # Split features into support and query
+        supp_fts = features[:n_ways * n_shots].view(n_ways, n_shots, -1, *features.shape[-2:])
+        qry_fts = features[n_ways * n_shots:].view(n_queries, -1, *features.shape[-2:])
         
         # Process support masks
         fore_mask = torch.stack([torch.stack(way, dim=0) for way in fore_mask], dim=0)
@@ -286,6 +334,9 @@ class FewShotSeg(nn.Module):
     def compute_alignment_loss(self, qry_fts, pred, supp_fts, fore_mask, back_mask):
         """
         Compute alignment loss for training
+        
+        This loss encourages consistent prototype assignments between
+        support and query images
         """
         n_ways = len(fore_mask)
         n_shots = len(fore_mask[0])
