@@ -10,6 +10,8 @@ from datetime import datetime
 from model import FewShotSeg
 from dataset import get_dataloader, get_transforms
 from utils.utils import AverageMeter, Metric, set_seed
+import warnings
+warnings.filterwarnings("ignore", message="xFormers is available")
 
 
 def save_checkpoint(model, optimizer, epoch, save_path):
@@ -115,9 +117,9 @@ def train(config):
             # print(sample_batched['query_labels'].shape)
 
             support_images = sample_batched['support_images'].to(device)
-            support_fg_masks = torch.unsqueeze(
+            support_fg_mask = torch.unsqueeze(
                 sample_batched['support_fg_masks'], dim=2).to(device)
-            support_bg_masks = torch.unsqueeze(
+            support_bg_mask = torch.unsqueeze(
                 sample_batched['support_bg_masks'], dim=2).to(device)
             query_images = sample_batched['query_images'].to(device)
             query_labels = torch.unsqueeze(

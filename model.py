@@ -232,23 +232,43 @@ class FewShotSeg(nn.Module):
 
     def get_features(self, imgs):
         """Extract features from images"""
+        # if 'dinov2' in self.config.get('which_model', ''):
+        #     # For DINOv2 models
+        #     # Ensure image size is divisible by patch size
+        #     patch_size = 14
+        #     h, w = (self.image_size // patch_size) * \
+        #         patch_size, (self.image_size // patch_size) * patch_size
+        #     imgs = F.interpolate(imgs, size=(h, w), mode='bilinear')
+
+        #     # Extract features
+        #     dino_fts = self.encoder.forward_features(imgs)
+        #     img_fts = dino_fts["x_norm_patchtokens"]  # B, HW, C
+        #     img_fts = img_fts.permute(0, 2, 1)  # B, C, HW
+
+        #     # Reshape to spatial features
+        #     C, HW = img_fts.shape[-2:]
+        #     h = w = int(HW**0.5)
+        #     img_fts = img_fts.view(-1, C, h, w)  # B, C, H, W
         if 'dinov2' in self.config.get('which_model', ''):
             # For DINOv2 models
-            # Ensure image size is divisible by patch size
             patch_size = 14
-            h, w = (self.image_size // patch_size) * \
-                patch_size, (self.image_size // patch_size) * patch_size
-            imgs = F.interpolate(imgs, size=(h, w), mode='bilinear')
+            # Explicitly calculate the resized dimensions divisible by patch_size
+            h, w = imgs.shape[2], imgs.shape[3]
+            new_h, new_w = (h // patch_size) * \
+                patch_size, (w // patch_size) * patch_size
+            imgs = F.interpolate(imgs, size=(new_h, new_w),
+                                 mode='bilinear', align_corners=False)
 
             # Extract features
             dino_fts = self.encoder.forward_features(imgs)
             img_fts = dino_fts["x_norm_patchtokens"]  # B, HW, C
             img_fts = img_fts.permute(0, 2, 1)  # B, C, HW
 
-            # Reshape to spatial features
-            C, HW = img_fts.shape[-2:]
-            h = w = int(HW**0.5)
-            img_fts = img_fts.view(-1, C, h, w)  # B, C, H, W
+            # Explicit spatial dimensions
+            h_feat = new_h // patch_size
+            w_feat = new_w // patch_size
+            img_fts = img_fts.view(-1, img_fts.size(1),
+                                   h_feat, w_feat)  # B, C, H', W'
         else:
             # For ResNet backbone
             img_fts = self.encoder(imgs)['out']
@@ -258,6 +278,7 @@ class FewShotSeg(nn.Module):
 
 
 ### FIX THIS ####################################################################################
+
 
     def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval=False, val_wsize=None):
         """
@@ -275,42 +296,28 @@ class FewShotSeg(nn.Module):
             output: Segmentation output
             align_loss: Alignment loss value (for training)
         """
-        n_ways = len(supp_imgs)
-        n_shots = len(supp_imgs[0])
-        n_queries = len(qry_imgs)
-        print("ways:", n_ways)
-        print("n_shots:", n_shots)
-        print("qry_imgs: ", qry_imgs.shape)
 
-        # Prepare support images
-        support_images = torch.cat([torch.cat(way, dim=0)
-                                   for way in supp_imgs], dim=0)
+        B, n_shot, C, H, W = supp_imgs.shape
+        supp_imgs_flat = supp_imgs.view(B * n_shot, C, H, W)
+        qry_imgs_flat = qry_imgs.view(B * 1, C, H, W)
 
-        # Concatenate with query images
-        imgs_concat = torch.cat(
-            [support_images, torch.cat(qry_imgs, dim=0)], dim=0)
+        supp_feat = self.get_features(supp_imgs_flat)
+        qry_feat = self.get_features(qry_imgs_flat)
 
-        # Extract features
-        features = self.get_features(imgs_concat)
-
-        # Split features into support and query
-        supp_fts = features[:n_ways *
-                            n_shots].view(n_ways, n_shots, -1, *features.shape[-2:])
-        qry_fts = features[n_ways *
-                           n_shots:].view(n_queries, -1, *features.shape[-2:])
-
-        # Process support masks
-        fore_mask = torch.stack([torch.stack(way, dim=0)
-                                for way in fore_mask], dim=0)
-        back_mask = torch.stack([torch.stack(way, dim=0)
-                                for way in back_mask], dim=0)
+        print(f"supp_feat: {supp_feat.shape}")
+        print(f"qry_feat: {qry_feat.shape}")
 
         # Resize masks to match feature size
-        fts_size = features.shape[-2:]
-        fore_mask_resized = torch.stack([F.interpolate(fore_mask_w, size=fts_size, mode='nearest')
-                                        for fore_mask_w in fore_mask], dim=0)
-        back_mask_resized = torch.stack([F.interpolate(back_mask_w, size=fts_size, mode='nearest')
-                                        for back_mask_w in back_mask], dim=0)
+        fore_mask_flat = fore_mask.view(
+            B * n_shot, 1, H, W)  # [B * n_shot, 1, H, W]
+        back_mask_flat = back_mask.view(B * n_shot, 1, H, W)
+        fore_mask_resized = F.interpolate(fore_mask_flat, size=(
+            supp_feat.size(2), supp_feat.size(3)), mode='nearest')
+        back_mask_resized = F.interpolate(back_mask_flat, size=(
+            supp_feat.size(2), supp_feat.size(3)), mode='nearest')
+
+        print(f"fore_mask_resized: {fore_mask_resized.shape}")
+        print(f"back_mask_resized: {back_mask_resized.shape}")
 
         # Compute segmentation scores
         outputs = []
