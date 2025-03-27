@@ -57,14 +57,19 @@ class ProtoModule(nn.Module):
             # Local prototypes (grid-based)
             nch = sup_x.shape[1]
             sup_nshot = sup_x.shape[0]
+            print(sup_x.shape)
             
             # Apply average pooling to get grid-level features
             n_sup_x = self.avg_pool_op(sup_x)
+            print(n_sup_x.shape)
             n_sup_x = n_sup_x.view(sup_nshot, nch, -1).permute(0, 2, 1).unsqueeze(0)
             n_sup_x = n_sup_x.reshape(1, -1, nch).unsqueeze(0)
+            print(n_sup_x.shape)
             
             # Apply average pooling to masks
+            print(sup_y.shape)
             sup_y_g = self.avg_pool_op(sup_y)
+            print(sup_y_g.shape)
             
             # Create prototype grid
             proto_grid = sup_y_g.clone().detach()
@@ -73,6 +78,7 @@ class ProtoModule(nn.Module):
             
             # Get features for grid cells above threshold
             sup_y_g = sup_y_g.view(sup_nshot, 1, -1).permute(1, 0, 2).view(1, -1).unsqueeze(0)
+            print(sup_y_g.shape)
             protos = n_sup_x[sup_y_g > thresh, :]  # npro, nc
             
             if protos.shape[0] == 0:
@@ -144,7 +150,7 @@ class FewShotSeg(nn.Module):
     """
     Few-shot segmentation model for eye fundus vessel segmentation
     """
-    def __init__(self, image_size=512, pretrained_path=None, cfg=None):
+    def __init__(self, image_size=224, pretrained_path=None, cfg=None):
         """
         Args:
             image_size: Input image size
@@ -266,7 +272,7 @@ class FewShotSeg(nn.Module):
         
         # Split features into support and query
         supp_fts = features[:n_ways * n_shots].view(n_ways, n_shots, -1, *features.shape[-2:])
-        qry_fts = features[n_ways * n_shots:].view(n_queries, -1, *features.shape[-2:])
+        qry_fts = features[n_ways * n_shots:].reshape(n_queries, -1, *features.shape[-2:])
         
         # Process support masks
         fore_mask = torch.stack([torch.stack(way, dim=0) for way in fore_mask], dim=0)

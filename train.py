@@ -112,6 +112,7 @@ def train(config):
             query_images = [query_image.to(device) for query_image in sample_batched['query_images']]
             query_labels = torch.cat([query_label.long().to(device) 
                                       for query_label in sample_batched['query_labels']], dim=0)
+            print("Shape of Labels" + str(query_labels.shape))
             
             # Forward pass
             optimizer.zero_grad()
@@ -223,7 +224,7 @@ if __name__ == "__main__":
                         help="Directory containing the dataset")
     parser.add_argument("--log_dir", type=str, default="./logs", 
                         help="Directory to save logs and checkpoints")
-    parser.add_argument("--image_size", type=int, default=512, 
+    parser.add_argument("--image_size", type=int, default=224, 
                         help="Input image size")
     parser.add_argument("--model_name", type=str, default="dinov2_vits", 
                         help="Model name: dinov2_vits, dinov2_vitb, dinov2_vitl")
