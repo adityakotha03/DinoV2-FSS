@@ -10,6 +10,8 @@ from datetime import datetime
 from model import FewShotSeg
 from dataset import get_dataloader, get_transforms
 from utils.utils import AverageMeter, Metric, set_seed
+import warnings
+warnings.filterwarnings("ignore", message="xFormers is available")
 
 
 def save_checkpoint(model, optimizer, epoch, save_path):
@@ -52,7 +54,7 @@ def train(config):
     model = model.to(device)
     model.train()
 
-    # Create data loaders (removed unsupported arguments)
+    # Create data loaders
     train_loader, _ = get_dataloader(
         base_dir=config.data_dir,
         mode='train',
@@ -107,33 +109,43 @@ def train(config):
         for batch_idx, sample_batched in enumerate(pbar):
             i_iter += 1
 
-            # list of tensors / list of support img
-            # print(sample_batched['support_images'].shape)
-            # print(sample_batched['support_bg_masks'].shape)
-            # print(sample_batched['support_fg_masks'].shape)
-            # print(sample_batched['query_images'].shape)
-            # print(sample_batched['query_labels'].shape)
-
+            # Extract and prepare data
             support_images = sample_batched['support_images'].to(device)
-            support_fg_masks = torch.unsqueeze(
-                sample_batched['support_fg_masks'], dim=2).to(device)
-            support_bg_masks = torch.unsqueeze(
-                sample_batched['support_bg_masks'], dim=2).to(device)
+            support_fg_mask = sample_batched['support_fg_masks'].to(device)
+            support_bg_mask = sample_batched['support_bg_masks'].to(device)
             query_images = sample_batched['query_images'].to(device)
-            query_labels = torch.unsqueeze(
-                sample_batched['query_labels'], dim=2).to(device)
-            # print("==========")
-            # print(support_images.shape)
-            # print(support_fg_masks.shape)
-            # print(support_bg_masks.shape)
-            # print(query_images.shape)
-            # print(query_labels.shape)
+            query_labels = sample_batched['query_labels'].to(device)
 
+            # Print shapes for debugging
+            if batch_idx == 0 and epoch == 0:
+                print(f"Support images shape: {support_images.shape}")
+                print(f"Support fg mask shape: {support_fg_mask.shape}")
+                print(f"Support bg mask shape: {support_bg_mask.shape}")
+                print(f"Query images shape: {query_images.shape}")
+                print(f"Query labels shape: {query_labels.shape}")
+
+            # Ensure correct dimensions for model input
+            # Make sure masks have channel dimension
+            if len(support_fg_mask.shape) == 4:  # [B, S, H, W]
+                support_fg_mask = support_fg_mask.unsqueeze(2)  # [B, S, 1, H, W]
+            if len(support_bg_mask.shape) == 4:  # [B, S, H, W]
+                support_bg_mask = support_bg_mask.unsqueeze(2)  # [B, S, 1, H, W]
+            
             # Forward pass
             optimizer.zero_grad()
             outputs, align_loss, _, _, _, _, _ = model(
                 support_images, support_fg_mask, support_bg_mask, query_images
             )
+
+            # Prepare query labels for loss calculation - ensure they're in the right format and type
+            # If query_labels is [B, 1, 1, H, W], squeeze to [B, H, W]
+            if len(query_labels.shape) == 5:
+                query_labels = query_labels.squeeze(1).squeeze(1)
+            elif len(query_labels.shape) == 4 and query_labels.shape[1] == 1:
+                query_labels = query_labels.squeeze(1)
+
+            # Convert to Long type as required by CrossEntropyLoss
+            query_labels = query_labels.long()
 
             # Compute loss
             query_loss = criterion(outputs, query_labels)
@@ -203,17 +215,35 @@ def validate(model, val_loader, device, config):
 
     with torch.no_grad():
         for sample_batched in tqdm(val_loader, desc="Validating"):
-            # Prepare data
-            support_images = [[shot.to(device) for shot in way]
-                              for way in sample_batched['support_images']]
-            support_fg_mask = [[shot['fg_mask'].float().to(device) for shot in way]
-                               for way in sample_batched['support_mask']]
-            support_bg_mask = [[shot['bg_mask'].float().to(device) for shot in way]
-                               for way in sample_batched['support_mask']]
-            query_images = [query_image.to(
-                device) for query_image in sample_batched['query_images']]
-            query_labels = torch.cat([query_label.to(device)
-                                      for query_label in sample_batched['query_labels']], dim=0)
+            # The validation loader might have a different structure
+            # Adapt this part based on your actual validation data format
+            
+            # Handle potentially different validation data format
+            if isinstance(sample_batched['support_images'], list):
+                # Complex nested structure
+                support_images = [[shot.to(device) for shot in way]
+                                for way in sample_batched['support_images']]
+                support_fg_mask = [[shot['fg_mask'].float().to(device) for shot in way]
+                                for way in sample_batched['support_mask']]
+                support_bg_mask = [[shot['bg_mask'].float().to(device) for shot in way]
+                                for way in sample_batched['support_mask']]
+                query_images = [query_image.to(
+                    device) for query_image in sample_batched['query_images']]
+                query_labels = torch.cat([query_label.to(device)
+                                        for query_label in sample_batched['query_labels']], dim=0)
+            else:
+                # Simple tensor structure (similar to training)
+                support_images = sample_batched['support_images'].to(device)
+                support_fg_mask = sample_batched['support_fg_masks'].to(device)
+                support_bg_mask = sample_batched['support_bg_masks'].to(device)
+                query_images = sample_batched['query_images'].to(device)
+                query_labels = sample_batched['query_labels'].to(device)
+                
+                # Ensure correct dimensions
+                if len(support_fg_mask.shape) == 4:
+                    support_fg_mask = support_fg_mask.unsqueeze(2)
+                if len(support_bg_mask.shape) == 4:
+                    support_bg_mask = support_bg_mask.unsqueeze(2)
 
             # Forward pass
             outputs, _, _, _, _, _, _ = model(
@@ -221,12 +251,18 @@ def validate(model, val_loader, device, config):
                 isval=True, val_wsize=config.val_wsize
             )
 
+            # Prepare query labels - ensure correct format
+            if len(query_labels.shape) > 3:
+                query_labels = query_labels.squeeze(1)
+                if len(query_labels.shape) > 3:
+                    query_labels = query_labels.squeeze(1)
+
             # Get predictions
             query_pred = outputs.argmax(dim=1).cpu().numpy()
-            query_labels = query_labels.cpu().numpy()
+            query_labels_np = query_labels.cpu().numpy()
 
             # Update metrics
-            for pred, label in zip(query_pred, query_labels):
+            for pred, label in zip(query_pred, query_labels_np):
                 metric.record(pred, label, labels=[1])
 
     # Calculate Dice score
@@ -245,7 +281,7 @@ if __name__ == "__main__":
                         help="Directory containing the dataset")
     parser.add_argument("--log_dir", type=str, default="./logs",
                         help="Directory to save logs and checkpoints")
-    parser.add_argument("--image_size", type=int, default=512,
+    parser.add_argument("--image_size", type=int, default=224,
                         help="Input image size")
     parser.add_argument("--model_name", type=str, default="dinov2_vits",
                         help="Model name: dinov2_vits, dinov2_vitb, dinov2_vitl")

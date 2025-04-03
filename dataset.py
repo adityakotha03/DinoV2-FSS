@@ -7,9 +7,6 @@ from torch.utils.data import Dataset
 import cv2
 from torchvision.transforms import functional as F
 
-# Move JointTransform to the module level so it can be pickled
-
-
 class JointTransform:
     def __call__(self, image_mask):
         if random.random() > 0.5:
@@ -130,7 +127,7 @@ class FundusVesselDataset(Dataset):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         # Direct conversion assuming images are already preprocessed.
         img = torch.from_numpy(np.transpose(img, (2, 0, 1))).float() / 255.0
-        img = self.normalize_image(img)
+        #img = self.normalize_image(img)
         return img
 
     def preprocess_mask(self, mask_path):
@@ -201,7 +198,8 @@ def get_transforms():
 
 def get_dataloader(base_dir, mode='train', batch_size=1, n_shots=1, num_workers=4):
     """Create a dataloader for the fundus vessel dataset."""
-    transform = get_transforms() if mode == 'train' else None
+    # transform = get_transforms() if mode == 'train' else None
+    transform = None
     dataset = FundusVesselDataset(
         base_dir=base_dir,
         mode=mode,

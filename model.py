@@ -7,11 +7,9 @@ import math
 def safe_norm(x, p=2, dim=1, eps=1e-4):
     """Normalize features"""
     x_norm = torch.norm(x, p=p, dim=dim)
-    x_norm = torch.max(x_norm, torch.ones_like(x_norm).cuda() * eps)
+    x_norm = torch.max(x_norm, torch.ones_like(x_norm).to(x.device) * eps)
     x = x.div(x_norm.unsqueeze(1).expand_as(x))
     return x
-
-### FIX THIS ####################################################################################
 
 
 class ProtoModule(nn.Module):
@@ -20,7 +18,7 @@ class ProtoModule(nn.Module):
     Computes prototype-based segmentation.
     """
 
-    def __init__(self, proto_grid_size=8, feature_hw=[64, 64], embed_dim=256):
+    def __init__(self, proto_grid_size=8, feature_hw=[32, 32], embed_dim=256):
         """
         Args:
             proto_grid_size: Grid size for multi-prototyping
@@ -41,57 +39,51 @@ class ProtoModule(nn.Module):
         Extract prototypes from support image features
 
         Args:
-            sup_x: Support image features [nshot, C, H, W]
-            sup_y: Support image masks [nshot, 1, H, W]
+            sup_x: Support image features [B, C, H, W]
+            sup_y: Support image masks [B, 1, H, W]
             mode: Prototype extraction mode ('mask' or 'gridconv')
             thresh: Threshold for considering a grid cell as foreground
 
         Returns:
             prototypes: Normalized prototypes
             proto_grid: Grid showing prototype assignment
+            non_zero: Indices of non-zero elements in proto_grid
         """
         if mode == 'mask':
             # Global prototype (average features in the mask)
-            proto = torch.sum(sup_x * sup_y, dim=(-1, -2)) / \
-                (sup_y.sum(dim=(-1, -2)) + 1e-5)
+            # Sum features where mask is 1, then divide by number of mask pixels
+            proto = torch.sum(sup_x * sup_y, dim=(-1, -2)) / (sup_y.sum(dim=(-1, -2)) + 1e-5)
             prototypes = proto
             proto_grid = sup_y.clone().detach()
             non_zero = torch.nonzero(proto_grid)
 
         elif mode == 'gridconv':
             # Local prototypes (grid-based)
-            nch = sup_x.shape[1]
-            sup_nshot = sup_x.shape[0]
+            nch = sup_x.shape[1]  # Number of channels
+            batch_size = sup_x.shape[0]  # Batch size
 
-            print(sup_x.shape)
-            
             # Apply average pooling to get grid-level features
-            n_sup_x = self.avg_pool_op(sup_x)
-            n_sup_x = n_sup_x.view(
-                sup_nshot, nch, -1).permute(0, 2, 1).unsqueeze(0)
-            print(n_sup_x.shape)
-            n_sup_x = n_sup_x.view(sup_nshot, nch, -1).permute(0, 2, 1).unsqueeze(0)
-            n_sup_x = n_sup_x.reshape(1, -1, nch).unsqueeze(0)
-
-            print(n_sup_x.shape)
+            n_sup_x = self.avg_pool_op(sup_x)  # [B, C, grid_h, grid_w]
             
+            # Reshape to prepare for extraction
+            n_sup_x = n_sup_x.view(batch_size, nch, -1)  # [B, C, grid_h*grid_w]
+            n_sup_x = n_sup_x.permute(0, 2, 1)  # [B, grid_h*grid_w, C]
+            n_sup_x = n_sup_x.reshape(-1, nch)  # [B*grid_h*grid_w, C]
+
             # Apply average pooling to masks
-            print(sup_y.shape)
-            sup_y_g = self.avg_pool_op(sup_y)
+            sup_y_g = self.avg_pool_op(sup_y)  # [B, 1, grid_h, grid_w]
 
-            print(sup_y_g.shape)
-            
             # Create prototype grid
             proto_grid = sup_y_g.clone().detach()
             proto_grid[proto_grid < thresh] = 0
             non_zero = torch.nonzero(proto_grid)
 
+            # Flatten sup_y_g to use as a selector
+            sup_y_g = sup_y_g.view(batch_size, 1, -1)  # [B, 1, grid_h*grid_w]
+            sup_y_g = sup_y_g.reshape(-1)  # [B*grid_h*grid_w]
+
             # Get features for grid cells above threshold
-            sup_y_g = sup_y_g.view(
-                sup_nshot, 1, -1).permute(1, 0, 2).view(1, -1).unsqueeze(0)
-            sup_y_g = sup_y_g.view(sup_nshot, 1, -1).permute(1, 0, 2).view(1, -1).unsqueeze(0)
-            print(sup_y_g.shape)
-            protos = n_sup_x[sup_y_g > thresh, :]  # npro, nc
+            protos = n_sup_x[sup_y_g > thresh, :]  # [num_prototypes, C]
 
             if protos.shape[0] == 0:
                 print("Warning: Failed to find prototypes, falling back to mask mode")
@@ -107,9 +99,9 @@ class ProtoModule(nn.Module):
         Generate predictions using prototypes
 
         Args:
-            prototypes: Extracted prototypes
-            query: Query image features
-            mode: Prediction mode
+            prototypes: Extracted prototypes [num_prototypes, C]
+            query: Query image features [B, C, H, W]
+            mode: Prediction mode ('mask' or 'gridconv')
 
         Returns:
             pred: Prediction map
@@ -117,32 +109,50 @@ class ProtoModule(nn.Module):
         """
         if mode == 'mask':
             # Global prototype matching
+            # Expand prototypes to [num_prototypes, C, 1, 1] for broadcasting
+            expanded_prototypes = prototypes.unsqueeze(-1).unsqueeze(-1)
+            
+            # Compute cosine similarity between query features and prototypes
             pred_mask = F.cosine_similarity(
-                query, prototypes[..., None, None], dim=1, eps=1e-4) * 20.0
-            pred_mask = pred_mask.max(dim=0)[0].unsqueeze(0)
-            return pred_mask.unsqueeze(1), [pred_mask]
+                query, expanded_prototypes, dim=1, eps=1e-4
+            ) * 20.0  # Scale factor
+            
+            # Get maximum similarity across prototypes
+            pred_mask = pred_mask.max(dim=0)[0].unsqueeze(0).unsqueeze(1)
+            return pred_mask, [pred_mask]
 
         elif mode == 'gridconv':
             # Local prototype matching with convolutional operation
-            dists = F.conv2d(query, prototypes[..., None, None]) * 20
-            pred_grid = torch.sum(F.softmax(dists, dim=1)
-                                  * dists, dim=1, keepdim=True)
+            # Use prototypes as convolutional kernels
+            prototypes_kernel = prototypes.unsqueeze(-1).unsqueeze(-1)  # [num_prototypes, C, 1, 1]
+            
+            # Compute similarities using convolution
+            dists = F.conv2d(query, prototypes_kernel) * 20  # Scaled similarities
+            
+            # Weighted sum of similarities (soft-assignment)
+            pred_grid = torch.sum(
+                F.softmax(dists, dim=1) * dists, 
+                dim=1, 
+                keepdim=True
+            )
+            
+            # For visualization: hard assignment of prototypes
             debug_assign = dists.argmax(dim=1).float().detach()
+            
             return pred_grid, [debug_assign]
 
         else:
-            raise ValueError(
-                f"Invalid mode: {mode}. Expected 'mask' or 'gridconv'")
+            raise ValueError(f"Invalid mode: {mode}. Expected 'mask' or 'gridconv'")
 
     def forward(self, qry, sup_x, sup_y, mode='gridconv', thresh=0.95):
         """
         Forward pass
 
         Args:
-            qry: Query image features [1, C, H, W]
-            sup_x: Support image features [nshot, C, H, W]
-            sup_y: Support image masks [nshot, 1, H, W]
-            mode: Operation mode
+            qry: Query image features [B, C, H, W]
+            sup_x: Support image features [B, C, H, W]
+            sup_y: Support image masks [B, 1, H, W]
+            mode: Operation mode ('mask' or 'gridconv')
             thresh: Threshold for prototype extraction
 
         Returns:
@@ -150,7 +160,7 @@ class ProtoModule(nn.Module):
             debug_assign: Debug information
             proto_grid: Grid showing prototype locations
         """
-        # Normalize query features
+        # Normalize query features if in gridconv mode
         qry_n = qry if mode == 'mask' else safe_norm(qry)
 
         # Get prototypes from support images
@@ -165,10 +175,9 @@ class ProtoModule(nn.Module):
 
 class FewShotSeg(nn.Module):
     """
-    Few-shot segmentation model for eye fundus vessel segmentation
+    Few-shot segmentation model for eye segmentation
     """
 
-    def __init__(self, image_size=512, pretrained_path=None, cfg=None):
     def __init__(self, image_size=224, pretrained_path=None, cfg=None):
         """
         Args:
@@ -179,7 +188,7 @@ class FewShotSeg(nn.Module):
         super(FewShotSeg, self).__init__()
         self.image_size = image_size
         self.pretrained_path = pretrained_path
-        self.config = cfg or {'align': False, 'debug': False}
+        self.config = cfg or {'align': False, 'debug': False, 'which_model': 'resnet50'}
 
         # Get encoder
         self.get_encoder()
@@ -235,6 +244,8 @@ class FewShotSeg(nn.Module):
             embed_dim = 768
         elif 'vitl' in self.config.get('which_model', ''):
             embed_dim = 1024
+        elif 'resnet' in self.config.get('which_model', ''):
+            embed_dim = 256
 
         self.cls_unit = ProtoModule(
             proto_grid_size=proto_hw,
@@ -246,21 +257,24 @@ class FewShotSeg(nn.Module):
         """Extract features from images"""
         if 'dinov2' in self.config.get('which_model', ''):
             # For DINOv2 models
-            # Ensure image size is divisible by patch size
             patch_size = 14
-            h, w = (self.image_size // patch_size) * \
-                patch_size, (self.image_size // patch_size) * patch_size
-            imgs = F.interpolate(imgs, size=(h, w), mode='bilinear')
+            # Explicitly calculate the resized dimensions divisible by patch_size
+            h, w = imgs.shape[2], imgs.shape[3]
+            new_h, new_w = (h // patch_size) * \
+                patch_size, (w // patch_size) * patch_size
+            imgs = F.interpolate(imgs, size=(new_h, new_w),
+                                 mode='bilinear', align_corners=False)
 
             # Extract features
             dino_fts = self.encoder.forward_features(imgs)
             img_fts = dino_fts["x_norm_patchtokens"]  # B, HW, C
             img_fts = img_fts.permute(0, 2, 1)  # B, C, HW
 
-            # Reshape to spatial features
-            C, HW = img_fts.shape[-2:]
-            h = w = int(HW**0.5)
-            img_fts = img_fts.view(-1, C, h, w)  # B, C, H, W
+            # Explicit spatial dimensions
+            h_feat = new_h // patch_size
+            w_feat = new_w // patch_size
+            img_fts = img_fts.view(-1, img_fts.size(1),
+                                   h_feat, w_feat)  # B, C, H', W'
         else:
             # For ResNet backbone
             img_fts = self.encoder(imgs)['out']
@@ -268,17 +282,14 @@ class FewShotSeg(nn.Module):
 
         return img_fts
 
-
-### FIX THIS ####################################################################################
-
     def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval=False, val_wsize=None):
         """
         Forward pass for few-shot segmentation
 
         Args:
             supp_imgs: Support images [batch_size, n_shot, channel, h, w]
-            fore_mask: Foreground masks for support images [batch_size, n_shot, channel, h, w]
-            back_mask: Background masks for support images [batch_size, n_shot, channel, h, w]
+            fore_mask: Foreground masks for support images [batch_size, n_shot, 1, h, w]
+            back_mask: Background masks for support images [batch_size, n_shot, 1, h, w]
             qry_imgs: Query images [batch_size, 1, channel, h, w]
             isval: Whether in validation mode
             val_wsize: Window size for validation
@@ -287,98 +298,98 @@ class FewShotSeg(nn.Module):
             output: Segmentation output
             align_loss: Alignment loss value (for training)
         """
-        n_ways = len(supp_imgs)
-        n_shots = len(supp_imgs[0])
-        n_queries = len(qry_imgs)
-        print("ways:", n_ways)
-        print("n_shots:", n_shots)
-        print("qry_imgs: ", qry_imgs.shape)
-
-        # Prepare support images
-        support_images = torch.cat([torch.cat(way, dim=0)
-                                   for way in supp_imgs], dim=0)
-
-        # Concatenate with query images
-        imgs_concat = torch.cat(
-            [support_images, torch.cat(qry_imgs, dim=0)], dim=0)
-
-        # Extract features
-        features = self.get_features(imgs_concat)
-
-        # Split features into support and query
-        supp_fts = features[:n_ways *
-                            n_shots].view(n_ways, n_shots, -1, *features.shape[-2:])
-        qry_fts = features[n_ways *
-                           n_shots:].view(n_queries, -1, *features.shape[-2:])
-
-        supp_fts = features[:n_ways * n_shots].view(n_ways, n_shots, -1, *features.shape[-2:])
-        qry_fts = features[n_ways * n_shots:].reshape(n_queries, -1, *features.shape[-2:])
+        # Get dimensions
+        B, n_shot, C, H, W = supp_imgs.shape
+        n_ways = 1  # Assuming 1-way few-shot segmentation (foreground vs background)
         
-        # Process support masks
-        fore_mask = torch.stack([torch.stack(way, dim=0)
-                                for way in fore_mask], dim=0)
-        back_mask = torch.stack([torch.stack(way, dim=0)
-                                for way in back_mask], dim=0)
-
+        # Reshape support and query images
+        supp_imgs_flat = supp_imgs.view(B * n_shot, C, H, W)
+        qry_imgs_flat = qry_imgs.view(B, C, H, W)
+        
+        # Extract features
+        supp_feat = self.get_features(supp_imgs_flat)
+        qry_feat = self.get_features(qry_imgs_flat)
+        
+        # Get feature sizes
+        _, _, h_feat, w_feat = supp_feat.shape
+        
+        # Reshape support features back to [B, n_shot, C, h, w]
+        supp_feat = supp_feat.view(B, n_shot, -1, h_feat, w_feat)
+        
         # Resize masks to match feature size
-        fts_size = features.shape[-2:]
-        fore_mask_resized = torch.stack([F.interpolate(fore_mask_w, size=fts_size, mode='nearest')
-                                        for fore_mask_w in fore_mask], dim=0)
-        back_mask_resized = torch.stack([F.interpolate(back_mask_w, size=fts_size, mode='nearest')
-                                        for back_mask_w in back_mask], dim=0)
-
-        # Compute segmentation scores
-        outputs = []
+        fore_mask_flat = fore_mask.view(B * n_shot, 1, H, W)
+        back_mask_flat = back_mask.view(B * n_shot, 1, H, W)
+        
+        fore_mask_resized = F.interpolate(fore_mask_flat, size=(h_feat, w_feat), mode='nearest')
+        back_mask_resized = F.interpolate(back_mask_flat, size=(h_feat, w_feat), mode='nearest')
+        
+        # Reshape resized masks back to [B, n_shot, 1, h, w]
+        fore_mask_resized = fore_mask_resized.view(B, n_shot, 1, h_feat, w_feat)
+        back_mask_resized = back_mask_resized.view(B, n_shot, 1, h_feat, w_feat)
+        
+        # Initialize variables for storing outputs
         align_loss = 0
-
-        # Background prediction
-        bg_prototype_mode = 'gridconv'
-        bg_score, bg_assign, bg_proto_grid = self.cls_unit(
-            qry=qry_fts,
-            sup_x=supp_fts[:, 0],
-            sup_y=back_mask_resized[:, 0],
-            mode=bg_prototype_mode,
-            thresh=0.95
-        )
-
-        # Foreground prediction
-        fg_prototype_mode = 'gridconv'
         fg_scores = []
         fg_assigns = []
         fg_proto_grids = []
-
+        
+        # Background prediction using all support images
+        bg_prototype_mode = 'gridconv'
+        
+        # For background, use all support images
+        bg_scores = []
+        for shot in range(n_shot):
+            bg_score, bg_assign, bg_proto_grid = self.cls_unit(
+                qry=qry_feat,  # Use all query features
+                sup_x=supp_feat[:, shot],  # Use features from this shot
+                sup_y=back_mask_resized[:, shot],  # Use background mask
+                mode=bg_prototype_mode,
+                thresh=0.95
+            )
+            bg_scores.append(bg_score)
+        
+        # Combine background scores from multiple shots (max pooling)
+        bg_score = torch.stack(bg_scores, dim=1).max(dim=1)[0] if n_shot > 1 else bg_scores[0]
+        
+        # Foreground prediction
+        fg_prototype_mode = 'gridconv'
+        
+        # For each way (typically just 1 in binary segmentation)
         for way in range(n_ways):
             way_scores = []
-            for shot in range(n_shots):
+            for shot in range(n_shot):
                 fg_score, fg_assign, fg_proto_grid = self.cls_unit(
-                    qry=qry_fts,
-                    sup_x=supp_fts[way, shot].unsqueeze(0),
-                    sup_y=fore_mask_resized[way, shot].unsqueeze(0),
+                    qry=qry_feat,
+                    sup_x=supp_feat[:, shot],
+                    sup_y=fore_mask_resized[:, shot],
                     mode=fg_prototype_mode,
                     thresh=0.95
                 )
                 way_scores.append(fg_score)
-
+            
             # Combine scores from multiple shots (if applicable)
-            combined_score = torch.stack(way_scores, dim=1).max(dim=1)[0]
+            if n_shot > 1:
+                combined_score = torch.stack(way_scores, dim=1).max(dim=1)[0]
+            else:
+                combined_score = way_scores[0]
+                
             fg_scores.append(combined_score)
             fg_assigns.append(fg_assign)
             fg_proto_grids.append(fg_proto_grid)
-
+        
         # Combine background and foreground scores
-        # N x (1 + ways) x H' x W'
+        # Shape: B x (1 + n_ways) x H' x W'
         pred = torch.cat([bg_score] + fg_scores, dim=1)
-
+        
         # Resize to original image size
-        output = F.interpolate(pred, size=(
-            self.image_size, self.image_size), mode='bilinear')
-
-        # If in training mode, compute alignment loss
-        if self.config['align'] and self.training:
+        output = F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=False)
+        
+        # If in training mode and alignment is configured, compute alignment loss
+        if self.config.get('align', False) and self.training:
             align_loss = self.compute_alignment_loss(
-                qry_fts, pred, supp_fts, fore_mask_resized, back_mask_resized
+                qry_feat, pred, supp_feat, fore_mask_resized, back_mask_resized
             )
-
+        
         return output, align_loss, [None, None], fg_assigns, fg_proto_grids, None, None
 
     def compute_alignment_loss(self, qry_fts, pred, supp_fts, fore_mask, back_mask):
@@ -387,35 +398,48 @@ class FewShotSeg(nn.Module):
 
         This loss encourages consistent prototype assignments between
         support and query images
+        
+        Args:
+            qry_fts: Query image features [B, C, H, W]
+            pred: Predicted segmentation [B, 2, H, W] (background, foreground)
+            supp_fts: Support image features [B, n_shot, C, H, W]
+            fore_mask: Foreground masks [B, n_shot, 1, H, W]
+            back_mask: Background masks [B, n_shot, 1, H, W]
+            
+        Returns:
+            loss: Alignment loss value
         """
-        n_ways = len(fore_mask)
-        n_shots = len(fore_mask[0])
+        B, n_shot = fore_mask.shape[0], fore_mask.shape[1]
+        n_ways = 1  # Binary segmentation (foreground vs background)
 
         # Get predicted segmentation
-        pred_mask = pred.argmax(dim=1).unsqueeze(0)  # 1 x N x H' x W'
+        pred_mask = pred.argmax(dim=1, keepdim=True)  # [B, 1, H, W]
 
-        # Create binary masks for each class
-        binary_masks = [pred_mask == i for i in range(1 + n_ways)]
+        # Create binary masks for each class (background=0, foreground=1)
+        binary_masks = [pred_mask == i for i in range(1 + n_ways)]  # [background_mask, foreground_mask]
 
         # Compute loss for each way and shot
-        loss = []
+        losses = []
+        
         for way in range(n_ways):
-            for shot in range(n_shots):
-                # Get query features and predicted mask
+            for shot in range(n_shot):
+                # Get binary masks from prediction on query image
                 qry_pred_fg_mask = F.interpolate(
                     binary_masks[way + 1].float(),
                     size=qry_fts.shape[-2:],
-                    mode='bilinear'
+                    mode='bilinear',
+                    align_corners=False
                 )
 
                 qry_pred_bg_mask = F.interpolate(
                     binary_masks[0].float(),
                     size=qry_fts.shape[-2:],
-                    mode='bilinear'
+                    mode='bilinear',
+                    align_corners=False
                 )
 
-                # Get support features
-                img_fts = supp_fts[way:way+1, shot:shot+1]
+                # Get support features for current shot
+                img_fts = supp_fts[:, shot]  # [B, C, H, W]
 
                 # Predict support image using query prototypes
                 bg_score, _, _ = self.cls_unit(
@@ -435,32 +459,36 @@ class FewShotSeg(nn.Module):
                 )
 
                 # Combine scores
-                supp_pred = torch.cat([bg_score, fg_score], dim=1)
+                supp_pred = torch.cat([bg_score, fg_score], dim=1)  # [B, 2, H, W]
 
                 # Resize to support mask size
                 supp_pred = F.interpolate(
                     supp_pred,
                     size=fore_mask.shape[-2:],
-                    mode='bilinear'
+                    mode='bilinear',
+                    align_corners=False
                 )
 
-                # Create support label
+                # Create support label 
+                # 0 for background, 1 for foreground, 255 for ignore
                 supp_label = torch.full_like(
-                    fore_mask[way, shot],
+                    fore_mask[:, shot, 0],  # [B, H, W]
                     255,
                     device=img_fts.device
                 ).long()
 
-                supp_label[fore_mask[way, shot] == 1] = 1
-                supp_label[back_mask[way, shot] == 1] = 0
+                # Set foreground and background labels
+                supp_label[fore_mask[:, shot, 0] == 1] = 1
+                supp_label[back_mask[:, shot, 0] == 1] = 0
 
                 # Compute cross-entropy loss
-                loss.append(
-                    F.cross_entropy(
-                        supp_pred.float(),
-                        supp_label[None, ...],
-                        ignore_index=255
-                    ) / (n_shots * n_ways)
-                )
+                loss = F.cross_entropy(
+                    supp_pred,
+                    supp_label,
+                    ignore_index=255,
+                    reduction='mean'
+                ) / (n_shot * n_ways)
+                
+                losses.append(loss)
 
-        return torch.sum(torch.stack(loss))
+        return torch.sum(torch.stack(losses))
