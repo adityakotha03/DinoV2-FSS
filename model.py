@@ -315,6 +315,7 @@ class FewShotSeg(nn.Module):
         
         # Reshape support features back to [B, n_shot, C, h, w]
         supp_feat = supp_feat.view(B, n_shot, -1, h_feat, w_feat)
+        print(f"Support images features shape: {supp_feat.shape}")
         
         # Resize masks to match feature size
         fore_mask_flat = fore_mask.view(B * n_shot, 1, H, W)
@@ -326,6 +327,8 @@ class FewShotSeg(nn.Module):
         # Reshape resized masks back to [B, n_shot, 1, h, w]
         fore_mask_resized = fore_mask_resized.view(B, n_shot, 1, h_feat, w_feat)
         back_mask_resized = back_mask_resized.view(B, n_shot, 1, h_feat, w_feat)
+        
+        print(f"Support fore ground mask features shape: {fore_mask_resized.shape}")
         
         # Initialize variables for storing outputs
         align_loss = 0

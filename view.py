@@ -8,11 +8,11 @@ if __name__ == "__main__":
     batch = next(iter(dataloader))
 
     # Extract components from the batch.
-    support_images = batch['support_images']         # [n_shots x 3 x H x W]
-    support_fg_masks = batch['support_fg_masks']         # [n_shots x H x W]
-    support_bg_masks = batch['support_bg_masks']         # [n_shots x H x W]
-    query_images = batch['query_images']               # [num_queries x 3 x H x W]
-    query_labels = batch['query_labels']               # [num_queries x H x W]
+    support_images = batch['support_images']         # [batch x n_shots x 3 x H x W]
+    support_fg_masks = batch['support_fg_masks']         # [batch x n_shots x H x W]
+    support_bg_masks = batch['support_bg_masks']         # [batch x n_shots x H x W]
+    query_images = batch['query_images']               # [batch x num_queries x 3 x H x W]
+    query_labels = batch['query_labels']               # [batch x num_queries x H x W]
 
     # Print out the shapes.
     print("Support images shape:", support_images.shape)
