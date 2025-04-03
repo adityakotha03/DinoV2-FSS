@@ -31,6 +31,7 @@ if __name__ == "__main__":
 
     # Extract features from support images using the same encoder.
     supp_feat = model.get_features(supp_imgs_flat)
+    print("Support features shape:", supp_feat.shape)
     _, _, h_feat, w_feat = supp_feat.shape
 
     # Resize masks to match feature map size.
@@ -44,7 +45,7 @@ if __name__ == "__main__":
     print(back_mask_resized.shape)
 
     # --- Visualization ---
-    fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(15, 5))
+    fig, (ax0, ax1, ax2, ax3) = plt.subplots(1, 4, figsize=(20, 5))
     ax0.imshow(fore_mask_flat[0, 0].cpu().numpy(), cmap='gray')
     ax0.set_title("Original Foreground Mask")
     ax0.axis('off')
@@ -54,4 +55,8 @@ if __name__ == "__main__":
     ax2.imshow(back_mask_resized[0, 0, 0].cpu().numpy(), cmap='gray')
     ax2.set_title("Resized Background Mask")
     ax2.axis('off')
+    feature_channel = supp_feat[0, 0].cpu().detach().numpy()  # shape: [h_feat, w_feat]
+    ax3.imshow(feature_channel, cmap='viridis')
+    ax3.set_title("Feature Channel 0")
+    ax3.axis('off')
     plt.show()
